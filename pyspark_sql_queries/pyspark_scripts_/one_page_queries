@@ -1,0 +1,160 @@
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+
+# ==============================================================================
+# INITIALIZE SPARK SESSION
+# ==============================================================================
+spark = SparkSession.builder \
+    .appName("RFM_Customer_Segmentation_Pipeline") \
+    .getOrCreate()
+
+
+# ==============================================================================
+# STAGE 1: INVOICE AGGREGATION
+# ==============================================================================
+df = spark.read.option('header', 'true').csv('sales.csv')
+df.createOrReplaceTempView("sales")
+
+bills = spark.sql("""
+    WITH bills AS (
+        SELECT 
+            InvoiceNo,
+            (CAST(Quantity AS DECIMAL(10, 2)) * CAST(UnitPrice AS DECIMAL(10, 2))) AS AMOUNT
+        FROM sales
+    )
+    SELECT
+        InvoiceNo, 
+        ROUND(SUM(AMOUNT), 2) AS total, 
+        COUNT(*) AS counts
+    FROM bills
+    GROUP BY InvoiceNo
+""")
+bills.createOrReplaceTempView("bills")
+
+
+# ==============================================================================
+# STAGE 2: RFM METRIC EXTRACTION
+# ==============================================================================
+rfm = spark.sql("""
+    WITH cte AS (
+        SELECT 
+            s.CustomerID, 
+            TO_DATE(MAX(s.InvoiceDate)) AS last_purchase_date,
+            TO_DATE(MIN(s.InvoiceDate)) AS first_purchase_date,
+            COUNT(DISTINCT s.InvoiceNo) AS num_purchase,      
+            ROUND(SUM(b.total), 2) AS monetary 
+        FROM sales s
+        LEFT JOIN bills b
+            ON s.InvoiceNo = b.InvoiceNo
+        GROUP BY s.CustomerID
+    )
+    SELECT 
+        CustomerID,
+        last_purchase_date,
+        first_purchase_date,
+        num_purchase,
+        monetary,
+        reference_date,
+        DATEDIFF(reference_date, last_purchase_date) AS recency,
+        ROUND(num_purchase / month_cust, 2) AS frequency 
+    FROM (
+        SELECT 
+            *, 
+            DATE_ADD(MAX(last_purchase_date) OVER (), 1) AS reference_date,
+            GREATEST(CAST(MONTHS_BETWEEN(last_purchase_date, first_purchase_date) AS INT), 0) + 1 AS month_cust
+        FROM cte
+    )
+""")
+rfm.createOrReplaceTempView("rfm")
+
+
+# ==============================================================================
+# STAGE 3: QUANTILE DISTRIBUTION
+# ==============================================================================
+rfm_quantile = spark.sql("""
+    SELECT
+        a.*,
+        -- Monetary Quantiles
+        b.percentile[1] AS m20, b.percentile[2] AS m40, b.percentile[3] AS m60, b.percentile[4] AS m80, b.percentile[5] AS m100,
+        -- Frequency Quantiles
+        c.percentile[1] AS f20, c.percentile[2] AS f40, c.percentile[3] AS f60, c.percentile[4] AS f80, c.percentile[5] AS f100,
+        -- Recency Quantiles
+        d.percentile[1] AS d20, d.percentile[2] AS d40, d.percentile[3] AS d60, d.percentile[4] AS d80, d.percentile[5] AS d100
+    FROM rfm a
+    CROSS JOIN (SELECT APPROX_PERCENTILE(monetary, ARRAY(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)) AS percentile FROM rfm) b
+    CROSS JOIN (SELECT APPROX_PERCENTILE(frequency, ARRAY(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)) AS percentile FROM rfm) c
+    CROSS JOIN (SELECT APPROX_PERCENTILE(recency, ARRAY(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)) AS percentile FROM rfm) d
+""")
+rfm_quantile.createOrReplaceTempView("rfm_quantile")
+
+
+# ==============================================================================
+# STAGE 4: RFM SCORING
+# ==============================================================================
+rfm_scored = spark.sql("""
+    SELECT
+        CustomerID,
+        m_score,
+        f_score,
+        r_score,
+        monetary,
+        frequency,
+        recency,
+        CAST(ROUND((f_score * m_score) / 2.0) AS BIGINT) AS fm_score
+    FROM (
+        SELECT
+            *,
+            CASE
+                WHEN monetary <= m20 THEN 1
+                WHEN monetary <= m40 AND monetary >= m20 THEN 2
+                WHEN monetary <= m60 AND monetary >= m40 THEN 3
+                WHEN monetary <= m80 AND monetary >= m60 THEN 4
+                WHEN monetary <= m100 AND monetary >= m80 THEN 5
+            END AS m_score,
+            CASE
+                WHEN frequency <= f20 THEN 1
+                WHEN frequency <= f40 AND frequency >= f20 THEN 2
+                WHEN frequency <= f60 AND frequency >= f40 THEN 3
+                WHEN frequency <= f80 AND frequency >= f60 THEN 4
+                WHEN frequency <= f100 AND frequency >= f80 THEN 5
+            END AS f_score,
+            CASE
+                WHEN recency <= d20 THEN 5
+                WHEN recency <= d40 AND recency >= d20 THEN 4
+                WHEN recency <= d60 AND recency >= d40 THEN 3
+                WHEN recency <= d80 AND recency >= d60 THEN 2
+                WHEN recency <= d100 AND recency >= d80 THEN 1
+            END AS r_score
+        FROM rfm_quantile
+    )
+""")
+rfm_scored.createOrReplaceTempView("rfm_final")
+
+
+# ==============================================================================
+# STAGE 5: CUSTOMER SEGMENTATION
+# ==============================================================================
+rfm_segmented = spark.sql("""
+    SELECT
+        CustomerID,
+        recency, frequency, monetary,
+        r_score, f_score, m_score,
+        fm_score,
+        CASE
+            WHEN (r_score = 5 AND fm_score = 5) OR (r_score = 5 AND fm_score = 4) OR (r_score = 4 AND fm_score = 5) THEN 'Champions'
+            WHEN (r_score = 5 AND fm_score = 3) OR (r_score = 4 AND fm_score = 4) OR (r_score = 3 AND fm_score = 5) OR (r_score = 3 AND fm_score = 4) THEN 'Loyal Customers'
+            WHEN (r_score = 5 AND fm_score = 2) OR (r_score = 4 AND fm_score = 2) OR (r_score = 3 AND fm_score = 3) OR (r_score = 4 AND fm_score = 3) THEN 'Potential Loyalists'
+            WHEN r_score = 5 AND fm_score = 1 THEN 'Recent Customers'
+            WHEN (r_score = 4 AND fm_score = 1) OR (r_score = 3 AND fm_score = 1) THEN 'Promising'
+            WHEN (r_score = 3 AND fm_score = 2) OR (r_score = 2 AND fm_score = 3) OR (r_score = 2 AND fm_score = 2) THEN 'Customers Needing Attention'
+            WHEN r_score = 2 AND fm_score = 1 THEN 'About to Sleep'
+            WHEN (r_score = 2 AND fm_score = 5) OR (r_score = 2 AND fm_score = 4) OR (r_score = 1 AND fm_score = 3) THEN 'At Risk'
+            WHEN (r_score = 1 AND fm_score = 5) OR (r_score = 1 AND fm_score = 4) THEN 'Cant Lose Them'
+            WHEN r_score = 1 AND fm_score = 2 THEN 'Hibernating'
+            WHEN r_score = 1 AND fm_score = 1 THEN 'Lost'
+        END AS rfm_segment
+    FROM rfm_final
+""")
+
+rfm_segmented.createOrReplaceTempView("rfm_segments")
+rfm_segmented.show()
