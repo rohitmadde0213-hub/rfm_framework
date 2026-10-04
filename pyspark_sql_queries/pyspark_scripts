@@ -1,1 +1,10 @@
-
+📂 pyspark-rfm-customer-segmentation/
+│
+├── 📂 pyspark_scripts/
+│   ├── 01_invoice_aggregation.py
+│   ├── 02_rfm_metrics_extraction.py
+│   ├── 03_quantile_distribution.py
+│   ├── 04_rfm_scoring.py
+│   └── 05_customer_segmentation.py
+│
+└── README.md
