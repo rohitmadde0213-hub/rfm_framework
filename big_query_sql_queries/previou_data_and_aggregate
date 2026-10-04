@@ -1,15 +1,12 @@
-Clean Up Your Queries into Individual .sql Files
+--------------------------------------------------------------------------------
+-- PROJECT: Google BigQuery RFM Customer Segmentation
+-- DESCRIPTION: End-to-end SQL data pipeline transforming raw sales logs 
+--              into actionable customer marketing segments.
+--------------------------------------------------------------------------------
 
--- Step 1: Preview raw sales data and compute line-item amounts
-SELECT 
-    InvoiceNo, 
-    StockCode, 
-    Quantity, 
-    UnitPrice,
-    (Quantity * UnitPrice) AS AMOUNT
-FROM `Sales.sale`;
-
--- Step 2: Aggregate total sales and item counts per invoice
+-- ==========================================
+-- STAGE 1: Invoice Aggregation
+-- ==========================================
 CREATE OR REPLACE TABLE `Sales.bills` AS
 WITH bills AS (
     SELECT 
@@ -23,3 +20,113 @@ SELECT
     COUNT(*) AS counts
 FROM bills
 GROUP BY InvoiceNo;
+
+
+-- ==========================================
+-- STAGE 2: RFM Metric Extraction
+-- ==========================================
+CREATE OR REPLACE TABLE `Sales.rfm` AS
+WITH cte AS (
+    SELECT 
+        s.CustomerID, 
+        DATE(MAX(s.InvoiceDate)) AS last_purchase_date,
+        DATE(MIN(s.InvoiceDate)) AS first_purchase_date,
+        COUNT(DISTINCT s.InvoiceNo) AS num_purchase,      
+        ROUND(SUM(b.total), 2) AS monetary 
+    FROM `Sales.sale` s
+    LEFT JOIN `Sales.bills` b
+        ON s.InvoiceNo = b.InvoiceNo
+    GROUP BY s.CustomerID
+)
+SELECT 
+    *,
+    DATE_DIFF(reference_date, last_purchase_date, DAY) AS recency,
+    ROUND(num_purchase / month_cust, 2) AS frequency 
+FROM (
+    SELECT 
+        *, 
+        MAX(last_purchase_date) OVER () + 1 AS reference_date,
+        DATE_DIFF(last_purchase_date, first_purchase_date, MONTH) + 1 AS month_cust
+    FROM cte
+);
+
+
+-- ==========================================
+-- STAGE 3: Quantile Generation
+-- ==========================================
+CREATE OR REPLACE TABLE `Sales.quantiles` AS
+SELECT 
+    a.*,
+    b.percentile[OFFSET(20)] AS m20, b.percentile[OFFSET(40)] AS m40, b.percentile[OFFSET(60)] AS m60, b.percentile[OFFSET(80)] AS m80, b.percentile[OFFSET(100)] AS m100,
+    c.percentile[OFFSET(20)] AS f20, c.percentile[OFFSET(40)] AS f40, c.percentile[OFFSET(60)] AS f60, c.percentile[OFFSET(80)] AS f80, c.percentile[OFFSET(100)] AS f100,
+    d.percentile[OFFSET(20)] AS d20, d.percentile[OFFSET(40)] AS d40, d.percentile[OFFSET(60)] AS d60, d.percentile[OFFSET(80)] AS d80, d.percentile[OFFSET(100)] AS d100
+FROM `Sales.rfm` a
+CROSS JOIN (SELECT APPROX_QUANTILES(monetary, 100) AS percentile FROM `Sales.rfm`) b
+CROSS JOIN (SELECT APPROX_QUANTILES(frequency, 100) AS percentile FROM `Sales.rfm`) c
+CROSS JOIN (SELECT APPROX_QUANTILES(recency, 100) AS percentile FROM `Sales.rfm`) d;
+
+
+-- ==========================================
+-- STAGE 4: RFM Scoring
+-- ==========================================
+CREATE OR REPLACE TABLE `Sales.score` AS
+SELECT 
+    CustomerID, 
+    m_score, 
+    f_score, 
+    r_score, 
+    monetary, 
+    frequency, 
+    recency, 
+    CAST(ROUND((f_score * m_score) / 2.0) AS INT64) AS fm_score
+FROM ( 
+    SELECT 
+        *, 
+        CASE 
+            WHEN monetary <= m20 THEN 1
+            WHEN monetary <= m40 AND monetary >= m20 THEN 2
+            WHEN monetary <= m60 AND monetary >= m40 THEN 3
+            WHEN monetary <= m80 AND monetary >= m60 THEN 4
+            WHEN monetary <= m100 AND monetary >= m80 THEN 5
+        END AS m_score,
+        CASE 
+            WHEN frequency <= f20 THEN 1
+            WHEN frequency <= f40 AND frequency >= f20 THEN 2
+            WHEN frequency <= f60 AND frequency >= f40 THEN 3
+            WHEN frequency <= f80 AND frequency >= f60 THEN 4
+            WHEN frequency <= f100 AND frequency >= f80 THEN 5
+        END AS f_score,
+        CASE 
+            WHEN recency <= d20 THEN 5
+            WHEN recency <= d40 AND recency >= d20 THEN 4
+            WHEN recency <= d60 AND recency >= d40 THEN 3
+            WHEN recency <= d80 AND recency >= d60 THEN 2
+            WHEN recency <= d100 AND recency >= d80 THEN 1
+        END AS r_score                        
+    FROM `Sales.quantiles`
+);
+
+
+-- ==========================================
+-- STAGE 5: Customer Segmentation
+-- ==========================================
+CREATE OR REPLACE TABLE `Sales.segments` AS
+SELECT
+    CustomerID,
+    recency, frequency, monetary,
+    r_score, f_score, m_score,
+    fm_score,
+    CASE 
+        WHEN (r_score = 5 AND fm_score = 5) OR (r_score = 5 AND fm_score = 4) OR (r_score = 4 AND fm_score = 5) THEN 'Champions'
+        WHEN (r_score = 5 AND fm_score = 3) OR (r_score = 4 AND fm_score = 4) OR (r_score = 3 AND fm_score = 5) OR (r_score = 3 AND fm_score = 4) THEN 'Loyal Customers'
+        WHEN (r_score = 5 AND fm_score = 2) OR (r_score = 4 AND fm_score = 2) OR (r_score = 3 AND fm_score = 3) OR (r_score = 4 AND fm_score = 3) THEN 'Potential Loyalists'
+        WHEN r_score = 5 AND fm_score = 1 THEN 'Recent Customers'
+        WHEN (r_score = 4 AND fm_score = 1) OR (r_score = 3 AND fm_score = 1) THEN 'Promising'
+        WHEN (r_score = 3 AND fm_score = 2) OR (r_score = 2 AND fm_score = 3) OR (r_score = 2 AND fm_score = 2) THEN 'Customers Needing Attention'
+        WHEN r_score = 2 AND fm_score = 1 THEN 'About to Sleep'
+        WHEN (r_score = 2 AND fm_score = 5) OR (r_score = 2 AND fm_score = 4) OR (r_score = 1 AND fm_score = 3) THEN 'At Risk'
+        WHEN (r_score = 1 AND fm_score = 5) OR (r_score = 1 AND fm_score = 4) THEN 'Cant Lose Them'
+        WHEN r_score = 1 AND fm_score = 2 THEN 'Hibernating'
+        WHEN r_score = 1 AND fm_score = 1 THEN 'Lost'
+    END AS rfm_segment
+FROM `Sales.score`;
