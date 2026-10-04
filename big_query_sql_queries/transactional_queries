@@ -1,0 +1,10 @@
+📂 bq-rfm-customer-segmentation/
+│
+├── 📂 sql/
+│   ├── 01_invoice_aggregation.sql
+│   ├── 02_rfm_metrics_extraction.sql
+│   ├── 03_quantile_distribution.sql
+│   ├── 04_rfm_scoring.sql
+│   └── 05_customer_segmentation.sql
+│
+└── README.md
